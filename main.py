@@ -91,15 +91,11 @@ async def cve_test(playwright):
 
         url = input('\nURL: ')
 
-        # Initialize the LangChain LLM model
-        llm_model = OpenAI(temperature=0.7)
 
-        # Ask for CVE ID here
-        cve_id = input("Enter the CVE ID to exploit: ").strip()
         
         async with async_playwright() as playwright:
-            # Pass the cve_id argument during instantiation
-            cve: CVE = CVE(base_url=url, llm_model=llm_model, cve_id=cve_id)
+            
+            cve: CVE = CVE(url=url)
             await cve.startup(playwright)  # Start the playwright and page instance
 
             # Run the exploitation
